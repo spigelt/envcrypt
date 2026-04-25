@@ -7,64 +7,79 @@ import (
 	"time"
 )
 
-// RotateKey decrypts an env file with the old identity, then re-encrypts it
-// with all current recipients plus an optional new recipient public key.
-// The original encrypted file is backed up before rotation.
-func RotateKey(encryptedPath, identityPath, recipientsPath string) (string, error) {
-	// Load the identity used to decrypt
-	identity, err := LoadIdentity(identityPath)
+// RotateKey generates a new identity, re-encrypts the env file with the new
+// key added as a recipient, backs up the old identity, and saves the new one.
+func RotateKey(envFile, identityFile string) error {
+	// Load existing identity
+	oldIdentity, err := LoadIdentity(identityFile)
 	if err != nil {
-		return "", fmt.Errorf("rotate: load identity: %w", err)
+		return fmt.Errorf("loading identity: %w", err)
 	}
 
-	// Decrypt the existing file to plaintext bytes
-	plaintext, err := DecryptEnvFile(encryptedPath, identityPath)
+	// Load existing recipients
+	recipientsFile := envFile + ".recipients"
+	recipients, err := LoadRecipients(recipientsFile)
 	if err != nil {
-		return "", fmt.Errorf("rotate: decrypt: %w", err)
+		return fmt.Errorf("loading recipients: %w", err)
 	}
 
-	// Load current recipients
-	recipients, err := LoadRecipients(recipientsPath)
+	// Generate new identity
+	newIdentity, err := GenerateIdentity()
 	if err != nil {
-		return "", fmt.Errorf("rotate: load recipients: %w", err)
+		return fmt.Errorf("generating new identity: %w", err)
 	}
 
-	if len(recipients) == 0 {
-		return "", fmt.Errorf("rotate: no recipients found in %s", recipientsPath)
+	// Add new recipient to the list
+	newRecipient := IdentityToRecipient(newIdentity)
+	if err := AddRecipient(recipientsFile, newRecipient.String()); err != nil {
+		return fmt.Errorf("adding new recipient: %w", err)
 	}
 
-	// Include the caller's own public key as a recipient so they can decrypt
-	ownRecipient := IdentityToRecipient(identity)
-	recipients = append(recipients, ownRecipient)
-
-	// Encrypt plaintext with all recipients
-	ciphertext, err := Encrypt(plaintext, recipients)
+	// Re-encrypt env file with updated recipients (including new key)
+	allRecipients := append(recipients, newRecipient)
+	plaintext, err := DecryptEnvFile(envFile, identityFile)
 	if err != nil {
-		return "", fmt.Errorf("rotate: encrypt: %w", err)
+		return fmt.Errorf("decrypting env file: %w", err)
 	}
 
-	// Back up the original file
-	backupPath := RotateBackupPath(encryptedPath)
-	original, err := os.ReadFile(encryptedPath)
+	ciphertext, err := Encrypt(plaintext, allRecipients)
 	if err != nil {
-		return "", fmt.Errorf("rotate: read original: %w", err)
-	}
-	if err := os.WriteFile(backupPath, original, 0600); err != nil {
-		return "", fmt.Errorf("rotate: write backup: %w", err)
+		return fmt.Errorf("re-encrypting env file: %w", err)
 	}
 
-	// Write the newly encrypted file
-	if err := os.WriteFile(encryptedPath, ciphertext, 0600); err != nil {
-		return "", fmt.Errorf("rotate: write rotated file: %w", err)
+	if err := os.WriteFile(envFile, ciphertext, 0644); err != nil {
+		return fmt.Errorf("writing re-encrypted env file: %w", err)
 	}
 
-	return backupPath, nil
+	// Backup old identity
+	backupPath := RotateBackupPath(identityFile)
+	oldData, err := os.ReadFile(identityFile)
+	if err != nil {
+		return fmt.Errorf("reading old identity: %w", err)
+	}
+	if err := os.WriteFile(backupPath, oldData, 0600); err != nil {
+		return fmt.Errorf("writing identity backup: %w", err)
+	}
+
+	// Remove old identity's public key from recipients
+	oldRecipient := IdentityToRecipient(oldIdentity)
+	_ = oldRecipient // removal from recipients file is a manual/future step
+
+	// Save new identity over old path
+	if err := os.Remove(identityFile); err != nil {
+		return fmt.Errorf("removing old identity file: %w", err)
+	}
+	if err := SaveIdentity(newIdentity, identityFile); err != nil {
+		return fmt.Errorf("saving new identity: %w", err)
+	}
+
+	return nil
 }
 
-// RotateBackupPath returns a timestamped backup path for the given file.
-func RotateBackupPath(encryptedPath string) string {
-	ext := filepath.Ext(encryptedPath)
-	base := encryptedPath[:len(encryptedPath)-len(ext)]
+// RotateBackupPath returns the backup path for an identity file during rotation.
+func RotateBackupPath(identityFile string) string {
+	dir := filepath.Dir(identityFile)
+	base := filepath.Base(identityFile)
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	return fmt.Sprintf("%s.%s.bak", base, timestamp)
+	return filepath.Join(dir, base+".backup."+timestamp)
 }
